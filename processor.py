@@ -212,10 +212,16 @@ class AudioProcessor:
         if skip_processing:
             # Decode-only path (no NR / loudnorm)
             run = subprocess.run(
-                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                 "-i", path, "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav],
+                [
+                    "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-i", path,
+                    "-map", "0:a:0?",  # first audio stream if present
+                    "-vn", "-sn", "-dn",
+                    "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", out_wav
+                ],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
+
             if run.returncode != 0:
                 raise RuntimeError("ffmpeg decode failed.")
         else:
