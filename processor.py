@@ -195,22 +195,15 @@ class AudioProcessor:
 
         self.input_path = path
         codec = (_ffprobe_codec_name(path) or "").lower()
-
-        # Decide noise reduction level and pre/post filters
+        out_wav = os.path.join(self.temp_dir, "processed.wav")
+        
         if codec == "opus":
-            # Opus-specific: lighter denoise to avoid "musical noise",
-            # keep low-frequency rumble out of loudnorm, and limit overshoot.
-            nf = max(LESS_NOISE_REDUCTION_LEVEL, -48)  # gentle
-            pre = f"highpass=f=60,afftdn=nf={nf}"
-            # Loudnorm as two-pass on the denoised signal, then limiter
-            out_wav = os.path.join(self.temp_dir, "processed.wav")
+            pre = "highpass=f=60,afftdn=nf=-48"
+            post = "alimiter=limit=-1.0:level=true" if _ffmpeg_has_filter("alimiter") else None
             self._process_with_two_pass_loudnorm(
-                src=path,
-                prefilter=pre,
-                I=target_lufs,
-                TP=-2.0,
-                LRA=11.0,
-                postfilter="alimiter=limit=-1.0:level=true",
+                src=path, prefilter=pre,
+                I=target_lufs, TP=-2.0, LRA=11.0,
+                postfilter=post,
                 out_wav=out_wav
             )
         else:
@@ -263,19 +256,26 @@ class AudioProcessor:
         )
         stats = _parse_loudnorm_json(run1.stderr or "")
         if not stats:
-            # If we failed to parse stats, fall back to single-pass on Opus with limiter.
-            fallback = f"{prefilter},loudnorm=I={I}:TP={TP}:LRA={LRA}"
+            chain = f"{prefilter},loudnorm=I={I}:TP={TP}:LRA={LRA}"
             if postfilter:
-                fallback = f"{fallback},{postfilter}"
-            cmd_fb = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", src, "-af", fallback,
-                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
-            ]
-            run_fb = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if run_fb.returncode != 0:
-                raise RuntimeError("ffmpeg processing (fallback) failed.")
+                chain = f"{chain},{postfilter}"
+            fb = subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src,
+                 "-af", chain, "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if fb.returncode != 0:
+                # fall back *again* without limiter in case the limiter caused the error
+                fb2 = subprocess.run(
+                    ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src,
+                     "-af", f"{prefilter},loudnorm=I={I}:TP={TP}:LRA={LRA}",
+                     "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+                if fb2.returncode != 0:
+                    raise RuntimeError("ffmpeg processing (fallback) failed.")
             return
+
 
         # ---- Pass 2: apply ----
         # Plug measured_* and offset into loudnorm and add a limiter.
@@ -450,7 +450,18 @@ class AudioProcessor:
                 pairs.append((s, e))
 
         return self._sanitize_pairs(pairs)
-
+        
+    def _ffmpeg_has_filter(name: str) -> bool:
+        try:
+            run = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-filters"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            txt = (run.stdout or "") + (run.stderr or "")
+            return run.returncode == 0 and f" {name} " in txt
+        except Exception:
+            return False
+    
     # -- conversion helpers --
 
     def _sanitize_pairs(self, pairs: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
