@@ -45,7 +45,18 @@ class SplitterUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Interactive Audio Splitter")
-        self.geometry("1180x720")
+        # Start maximized across platforms (Windows/Linux); keep geometry as fallback.
+        try:
+            self.state("zoomed")
+        except Exception:
+            pass
+        try:
+            self.attributes("-zoomed", True)
+        except Exception:
+            pass
+        # Fallback size if maximized state is ignored by the WM
+        self.geometry("1600x900")
+
 
         # Engine
         self.processor = AudioProcessor()
@@ -239,6 +250,34 @@ class SplitterUI(tk.Tk):
             skip_processing=self.var_bypass_processing.get(),
         )
 
+        # Build a light-weight envelope for plotting (decimated)
+        x = self.processor.samples
+        sr = self.processor.sample_rate
+        if x is not None and sr is not None:
+            max_points = 8000
+            n = len(x)
+            if n <= max_points:
+                self.envelope_x = np.linspace(0, self.processor.duration, n)
+                self.envelope_y = x
+            else:
+                bin_size = int(math.ceil(n / max_points))
+                trimmed = x[: (n // bin_size) * bin_size]
+                y = trimmed.reshape(-1, bin_size)
+                y = np.max(np.abs(y), axis=1) * np.sign(np.sum(y, axis=1))
+                self.envelope_x = np.linspace(0, self.processor.duration, len(y))
+                self.envelope_y = y
+
+        self.boundaries = [0.0, self.processor.duration]
+        self.selected_seg_idx = None
+        self.current_segments = []
+        self.first_interval_is_segment = True
+
+        self.var_view_start.set(0.0)
+        self._update_view_slider_range()
+        self._refresh_plot(False)
+        self._apply_view_limits()
+
+        self._set_status("Processed. Use Auto-Detect or add boundaries manually.")
 
     def on_detection_param_change(self, _evt=None) -> None:
         if self.processor.processed_wav:
