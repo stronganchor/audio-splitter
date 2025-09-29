@@ -492,26 +492,29 @@ class SplitterUI(tk.Tk):
             if b <= a + 0.01:
                 continue
     
-            # duration for accurate trimming and fade placement
             dur = max(0.05, b - a)
     
-            # very short micro-fades to suppress clicks at cut points
-            # fade-in at 0s, fade-out ending at dur
+            # micro-fades to remove clicks at non–zero-crossing cuts
             fade_d = 0.006  # 6 ms
             fade_out_start = max(0.0, dur - fade_d)
-            fade_filter = f"afade=t=in:st=0:d={fade_d:.3f},afade=t=out:st={fade_out_start:.3f}:d={fade_d:.3f}"
+            fade_filter = (
+                f"afade=t=in:st=0:d={fade_d:.3f},"
+                f"afade=t=out:st={fade_out_start:.3f}:d={fade_d:.3f}"
+            )
     
             ext = "wav" if fmt == "wav" else "mp3"
             out_path = os.path.join(out_dir, f"segment_{i + 1:03d}.{ext}")
     
-            # Use input-then-seek for sample-accurate cuts; add -accurate_seek
-            cmd = ["ffmpeg", "-y",
-                   "-accurate_seek",
-                   "-i", src,
-                   "-ss", f"{a:.3f}",
-                   "-to", f"{b:.3f}",
-                   "-af", fade_filter,
-                   "-avoid_negative_ts", "make_zero"]
+            # Accurate seek: put -ss/-t AFTER -i so it's decode-accurate.
+            # Use -t (duration) instead of -to (absolute stop time).
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", src,
+                "-ss", f"{a:.3f}",
+                "-t", f"{dur:.3f}",
+                "-af", fade_filter,
+                "-avoid_negative_ts", "make_zero",
+            ]
     
             if fmt == "wav":
                 cmd += ["-ar", "48000", "-ac", "1", "-acodec", "pcm_s16le", out_path]
