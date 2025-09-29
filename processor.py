@@ -233,9 +233,13 @@ class AudioProcessor:
                 nf = MORE_NOISE_REDUCTION_LEVEL if use_more_noise else LESS_NOISE_REDUCTION_LEVEL
                 filter_chain = f"afftdn=nf={nf},loudnorm=I={target_lufs}:TP=-2:LRA=11"
                 run = subprocess.run(
-                    ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                     "-i", path, "-af", filter_chain,
-                     "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav],
+                    [
+                        "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+                        "-i", path,
+                        "-map", "0:a:0?",  # pick first audio stream if present
+                        "-vn", "-sn", "-dn",
+                        "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
+                    ],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
                 )
                 if run.returncode != 0:
