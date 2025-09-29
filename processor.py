@@ -173,6 +173,18 @@ class AudioProcessor:
         # Optional transcript
         self.transcript: Optional[TranscriptData] = None
 
+    def _ffmpeg_has_filter(self, name: str) -> bool:
+        try:
+            run = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-filters"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            txt = (run.stdout or "") + (run.stderr or "")
+            # Match whole-word filter names (surrounded by spaces) to avoid substrings
+            return run.returncode == 0 and f" {name} " in txt
+        except Exception:
+            return False
+
     # -- lifecycle --
 
     def cleanup(self) -> None:
@@ -196,10 +208,10 @@ class AudioProcessor:
         self.input_path = path
         codec = (_ffprobe_codec_name(path) or "").lower()
         out_wav = os.path.join(self.temp_dir, "processed.wav")
-        
+
         if codec == "opus":
             pre = "highpass=f=60,afftdn=nf=-48"
-            post = "alimiter=limit=-1.0:level=true" if _ffmpeg_has_filter("alimiter") else None
+            post = "alimiter=limit=-1.0:level=true" if self._ffmpeg_has_filter("alimiter") else None
             self._process_with_two_pass_loudnorm(
                 src=path, prefilter=pre,
                 I=target_lufs, TP=-2.0, LRA=11.0,
@@ -450,18 +462,8 @@ class AudioProcessor:
                 pairs.append((s, e))
 
         return self._sanitize_pairs(pairs)
-        
-    def _ffmpeg_has_filter(name: str) -> bool:
-        try:
-            run = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-filters"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            txt = (run.stdout or "") + (run.stderr or "")
-            return run.returncode == 0 and f" {name} " in txt
-        except Exception:
-            return False
-    
+
+
     # -- conversion helpers --
 
     def _sanitize_pairs(self, pairs: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
