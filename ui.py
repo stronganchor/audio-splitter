@@ -211,7 +211,7 @@ class SplitterUI(tk.Tk):
         path = filedialog.askopenfilename(
             title="Select audio/video file",
             filetypes=[
-                ("Media", "*.wav;*.mp3;*.m4a;*.aac;*.flac;*.ogg;*.mp4;*.mkv;*.mov;*.avi"),
+                ("Media", "*.wav;*.mp3;*.m4a;*.aac;*.flac;*.ogg;*.opus;*.mp4;*.mkv;*.mov;*.avi"),
                 ("All", "*.*"),
             ],
         )
@@ -473,68 +473,58 @@ class SplitterUI(tk.Tk):
         if len(self.boundaries) < 2:
             messagebox.showinfo("No segments", "No boundaries defined.")
             return
-
+    
         out_dir = filedialog.askdirectory(title="Choose output folder")
         if not out_dir:
             return
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except Exception as e:
-            messagebox.showerror("Folder error", f"Could not access/create folder:\n{out_dir}\n\n{e}")
-            return
-
+    
         fmt = self.var_format.get().lower()
-        bitrate = self.var_bitrate.get().strip() or "192k"
+        bitrate = self.var_bitrate.get()
         src = self.processor.processed_wav
-
+    
         count = 0
-        failures = []
-
         for i in range(len(self.boundaries) - 1):
             if not self._interval_is_segment(i):
                 continue  # export only true segments
-
-            # Apply small head/tail buffers to avoid clipping
+    
             a = max(0.0, self.boundaries[i] - HEAD_BUFFER)
             b = min(self.processor.duration, self.boundaries[i + 1] + TAIL_BUFFER)
             if b <= a + 0.01:
                 continue
-
-            dur = max(0.01, b - a)
+    
+            # duration for accurate trimming and fade placement
+            dur = max(0.05, b - a)
+    
+            # very short micro-fades to suppress clicks at cut points
+            # fade-in at 0s, fade-out ending at dur
+            fade_d = 0.006  # 6 ms
+            fade_out_start = max(0.0, dur - fade_d)
+            fade_filter = f"afade=t=in:st=0:d={fade_d:.3f},afade=t=out:st={fade_out_start:.3f}:d={fade_d:.3f}"
+    
             ext = "wav" if fmt == "wav" else "mp3"
             out_path = os.path.join(out_dir, f"segment_{i + 1:03d}.{ext}")
-
-            # More reliable seeking: put -ss AFTER -i and use -t (duration), not -to
-            cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                   "-i", src, "-ss", f"{a:.3f}", "-t", f"{dur:.3f}"]
-
+    
+            # Use input-then-seek for sample-accurate cuts; add -accurate_seek
+            cmd = ["ffmpeg", "-y",
+                   "-accurate_seek",
+                   "-i", src,
+                   "-ss", f"{a:.3f}",
+                   "-to", f"{b:.3f}",
+                   "-af", fade_filter,
+                   "-avoid_negative_ts", "make_zero"]
+    
             if fmt == "wav":
-                cmd += ["-ac", "1", "-ar", "48000", "-acodec", "pcm_s16le", out_path]
+                cmd += ["-ar", "48000", "-ac", "1", "-acodec", "pcm_s16le", out_path]
             else:
-                cmd += ["-ac", "1", "-ar", "48000", "-c:a", "libmp3lame", "-b:a", bitrate, out_path]
-
-            run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
-            if run.returncode == 0 and os.path.exists(out_path):
+                cmd += ["-ar", "48000", "-ac", "1", "-b:a", bitrate, "-c:a", "libmp3lame", out_path]
+    
+            run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if run.returncode == 0:
                 count += 1
-            else:
-                # Keep a short reason to help debug if nothing exported
-                msg = run.stderr.strip().splitlines()[-1] if run.stderr else "Unknown ffmpeg error"
-                failures.append((i + 1, msg))
-
-        if count == 0:
-            detail = f"\n\nExample error: {failures[0][1]}" if failures else ""
-            messagebox.showerror("Export failed", f"No files were exported.{detail}")
-            self._set_status("Export failed (no files created).")
-            return
-
+    
         self._set_status(f"Exported {count} segment(s) to: {out_dir}")
-        if failures:
-            first_fail = f"\n\nSome segments failed (e.g., #{failures[0][0]}): {failures[0][1]}"
-            messagebox.showinfo("Export partially complete",
-                                f"Exported {count} segment(s) to:\n{out_dir}{first_fail}")
-        else:
-            messagebox.showinfo("Export complete", f"Exported {count} segment(s) to:\n{out_dir}")
-
+        messagebox.showinfo("Export complete", f"Exported {count} segment(s) to:\n{out_dir}")
+    
     # ------------------- Transcription & Rename -------------------
 
     def transcribe_and_rename(self) -> None:
