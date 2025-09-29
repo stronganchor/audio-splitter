@@ -276,7 +276,7 @@ class AudioProcessor:
 
         run1 = subprocess.run(
             [
-                "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
                 "-i", src,
                 "-af", filt1,
                 "-ar", "48000", "-ac", "1",
@@ -284,22 +284,23 @@ class AudioProcessor:
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
+
         stats = _parse_loudnorm_json(run1.stderr or "")
         if not stats:
             chain = f"{prefilter},loudnorm=I={I}:TP={TP}:LRA={LRA}"
             if postfilter:
                 chain = f"{chain},{postfilter}"
             fb = subprocess.run(
-                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src,
-                 "-af", chain, "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav],
+                ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", src,
+                 "-af", chain, "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", out_wav],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
             if fb.returncode != 0:
                 # fall back *again* without limiter in case the limiter caused the error
                 fb2 = subprocess.run(
-                    ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src,
+                    ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", src,
                      "-af", f"{prefilter},loudnorm=I={I}:TP={TP}:LRA={LRA}",
-                     "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav],
+                     "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", out_wav],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
                 )
                 if fb2.returncode != 0:
@@ -326,13 +327,14 @@ class AudioProcessor:
 
         run2 = subprocess.run(
             [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
                 "-i", src,
                 "-af", chain,
-                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
+                "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", out_wav
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
+
         if run2.returncode != 0:
             raise RuntimeError("ffmpeg processing (pass2) failed.")
 
@@ -341,13 +343,27 @@ class AudioProcessor:
             sr = wf.getframerate()
             ch = wf.getnchannels()
             n = wf.getnframes()
+            sampwidth = wf.getsampwidth()
             self.sample_rate = sr
             self.duration = n / float(sr)
-
+    
             frames = wf.readframes(n)
-            audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-            if ch == 2:
-                audio = audio.reshape(-1, 2).mean(axis=1)  # downmix to mono
+            if sampwidth == 4:
+                audio = np.frombuffer(frames, dtype=np.float32)
+                # Ensure mono
+                if ch == 2:
+                    audio = audio.reshape(-1, 2).mean(axis=1)
+                # Clamp any stray out-of-range values
+                audio = np.clip(audio, -1.0, 1.0)
+            elif sampwidth == 2:
+                audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+                if ch == 2:
+                    audio = audio.reshape(-1, 2).mean(axis=1)
+            else:
+                # Fallback: interpret as int16 to avoid crashing
+                audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+                if ch == 2:
+                    audio = audio.reshape(-1, 2).mean(axis=1)
             self.samples = audio
 
     def _compute_rms_db(self) -> None:
@@ -394,10 +410,12 @@ class AudioProcessor:
             return []
 
         cmd = [
-            "ffmpeg", "-hide_banner", "-nostats", "-i", self.processed_wav,
-            "-af", f"silencedetect=noise={threshold_db}dB:d={min_silence}",
-            "-f", "null", "-"
+            "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-i", path,
+            "-af", filter_chain,
+            "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", out_wav
         ]
+
         run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
         text = run.stderr
 
