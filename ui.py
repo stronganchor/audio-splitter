@@ -45,7 +45,7 @@ class SplitterUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Interactive Audio Splitter")
-        # Start maximized across platforms (Windows/Linux); keep geometry as fallback.
+        # Start maximized; keep a reasonable fallback size.
         try:
             self.state("zoomed")
         except Exception:
@@ -54,9 +54,7 @@ class SplitterUI(tk.Tk):
             self.attributes("-zoomed", True)
         except Exception:
             pass
-        # Fallback size if maximized state is ignored by the WM
         self.geometry("1600x900")
-
 
         # Engine
         self.processor = AudioProcessor()
