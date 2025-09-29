@@ -492,34 +492,34 @@ class SplitterUI(tk.Tk):
             if b <= a + 0.01:
                 continue
     
-            dur = max(0.05, b - a)
+            dur = b - a
     
-            # micro-fades to remove clicks at non–zero-crossing cuts
-            fade_d = 0.006  # 6 ms
-            fade_out_start = max(0.0, dur - fade_d)
-            fade_filter = (
-                f"afade=t=in:st=0:d={fade_d:.3f},"
-                f"afade=t=out:st={fade_out_start:.3f}:d={fade_d:.3f}"
+            # Short micro-fades to prevent clicks; clamp for very short clips
+            fd = min(0.006, max(0.0, dur * 0.25))
+            fade_out_start = max(0.0, dur - fd)
+    
+            # Trim inside the filtergraph (no -ss/-t ambiguity), then reset PTS and fade
+            filt = (
+                f"atrim=start={a:.6f}:end={b:.6f},"
+                f"asetpts=PTS-STARTPTS,"
+                f"afade=t=in:st=0:d={fd:.4f},"
+                f"afade=t=out:st={fade_out_start:.4f}:d={fd:.4f}"
             )
     
             ext = "wav" if fmt == "wav" else "mp3"
             out_path = os.path.join(out_dir, f"segment_{i + 1:03d}.{ext}")
     
-            # Accurate seek: put -ss/-t AFTER -i so it's decode-accurate.
-            # Use -t (duration) instead of -to (absolute stop time).
             cmd = [
                 "ffmpeg", "-y",
+                "-hide_banner", "-loglevel", "error",
                 "-i", src,
-                "-ss", f"{a:.3f}",
-                "-t", f"{dur:.3f}",
-                "-af", fade_filter,
-                "-avoid_negative_ts", "make_zero",
+                "-af", filt,
             ]
     
             if fmt == "wav":
-                cmd += ["-ar", "48000", "-ac", "1", "-acodec", "pcm_s16le", out_path]
+                cmd += ["-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_path]
             else:
-                cmd += ["-ar", "48000", "-ac", "1", "-b:a", bitrate, "-c:a", "libmp3lame", out_path]
+                cmd += ["-ar", "48000", "-ac", "1", "-c:a", "libmp3lame", "-b:a", bitrate, out_path]
     
             run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if run.returncode == 0:
