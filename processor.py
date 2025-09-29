@@ -8,11 +8,12 @@ import math
 import wave
 import atexit
 import shutil
+import json
 import tempfile
 import subprocess
 import contextlib
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 
@@ -31,8 +32,8 @@ except Exception:  # pragma: no cover
 
 # --------------------------- Defaults / Tunables ---------------------------
 
-LESS_NOISE_REDUCTION_LEVEL = -50  # dB for afftdn noise floor
-MORE_NOISE_REDUCTION_LEVEL = -30  # dB for afftdn noise floor
+LESS_NOISE_REDUCTION_LEVEL = -50  # dB for afftdn noise floor (gentler)
+MORE_NOISE_REDUCTION_LEVEL = -30  # dB for afftdn noise floor (stronger)
 DEFAULT_TARGET_LUFS = -18.0       # loudnorm target
 
 # Boundary snapping window (seconds) used when aligning to local RMS minima
@@ -77,6 +78,68 @@ def ffplay_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def _ffprobe_codec_name(path: str) -> Optional[str]:
+    """
+    Return codec_name for the first audio stream using ffprobe, or None on failure.
+    """
+    try:
+        run = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=nw=1:nk=1",
+                path,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if run.returncode == 0:
+            name = (run.stdout or "").strip().lower()
+            return name or None
+    except Exception:
+        pass
+    return None
+
+
+def _parse_loudnorm_json(stderr_text: str) -> Optional[Dict[str, float]]:
+    """
+    Parse ffmpeg loudnorm print_format=json output and return the fields needed for pass2.
+    Returns dict with keys: measured_I, measured_LRA, measured_TP, measured_thresh, offset
+    """
+    # Try to find a JSON block. loudnorm writes it to stderr.
+    # We look for the last {...} block to be safe.
+    blocks = re.findall(r"\{.*?\}", stderr_text, flags=re.DOTALL)
+    if not blocks:
+        return None
+    for blob in reversed(blocks):
+        try:
+            data = json.loads(blob)
+            # ffmpeg may emit as strings; coerce to float
+            need = ["input_i", "input_tp", "input_lra", "input_thresh",
+                    "target_offset", "measured_i", "measured_lra", "measured_tp", "measured_thresh", "offset"]
+            present = {k.lower(): v for k, v in data.items()}
+            # Normalize keys
+            def fget(*keys):
+                for k in keys:
+                    v = present.get(k)
+                    if v is not None:
+                        return float(v)
+                return None
+
+            measured = {
+                "measured_I": fget("measured_i", "input_i"),
+                "measured_LRA": fget("measured_lra", "input_lra"),
+                "measured_TP": fget("measured_tp", "input_tp"),
+                "measured_thresh": fget("measured_thresh", "input_thresh"),
+                "offset": fget("offset", "target_offset", "normalization_offset"),
+            }
+            if all(v is not None for v in measured.values()):
+                return measured  # type: ignore
+        except Exception:
+            continue
+    return None
 
 
 # ------------------------------ Core Engine --------------------------------
@@ -124,28 +187,124 @@ class AudioProcessor:
     def load_and_process(self, path: str, use_more_noise: bool, target_lufs: float) -> None:
         """
         Run ffmpeg with noise reduction + loudnorm, convert to mono 48k WAV.
+        For Opus inputs: use gentler denoise, two-pass loudnorm (measure→apply), and a limiter.
         Populates: processed_wav, sample_rate, samples, duration, rms_db.
         """
         if not ffmpeg_exists():
             raise RuntimeError("ffmpeg was not found in PATH.")
 
         self.input_path = path
-        nf = MORE_NOISE_REDUCTION_LEVEL if use_more_noise else LESS_NOISE_REDUCTION_LEVEL
-        out_wav = os.path.join(self.temp_dir, "processed.wav")
+        codec = (_ffprobe_codec_name(path) or "").lower()
 
-        # afftdn: frequency-domain denoiser; loudnorm: EBU R128 loudness normalization
-        filter_chain = f"afftdn=nf={nf},loudnorm=I={target_lufs}:TP=-2:LRA=11"
-        cmd = [
-            "ffmpeg", "-y", "-i", path, "-af", filter_chain,
-            "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
-        ]
-        run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if run.returncode != 0:
-            raise RuntimeError("ffmpeg processing failed.")
+        # Decide noise reduction level and pre/post filters
+        if codec == "opus":
+            # Opus-specific: lighter denoise to avoid "musical noise",
+            # keep low-frequency rumble out of loudnorm, and limit overshoot.
+            nf = max(LESS_NOISE_REDUCTION_LEVEL, -48)  # gentle
+            pre = f"highpass=f=60,afftdn=nf={nf}"
+            # Loudnorm as two-pass on the denoised signal, then limiter
+            out_wav = os.path.join(self.temp_dir, "processed.wav")
+            self._process_with_two_pass_loudnorm(
+                src=path,
+                prefilter=pre,
+                I=target_lufs,
+                TP=-2.0,
+                LRA=11.0,
+                postfilter="alimiter=limit=-1.0:level=true",
+                out_wav=out_wav
+            )
+        else:
+            # Non-Opus: keep previous single-pass flow
+            nf = MORE_NOISE_REDUCTION_LEVEL if use_more_noise else LESS_NOISE_REDUCTION_LEVEL
+            out_wav = os.path.join(self.temp_dir, "processed.wav")
+            filter_chain = f"afftdn=nf={nf},loudnorm=I={target_lufs}:TP=-2:LRA=11"
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", path,
+                "-af", filter_chain,
+                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
+            ]
+            run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if run.returncode != 0:
+                raise RuntimeError("ffmpeg processing failed.")
 
         self.processed_wav = out_wav
         self._load_wav(out_wav)
         self._compute_rms_db()
+
+    def _process_with_two_pass_loudnorm(
+        self,
+        src: str,
+        prefilter: str,
+        I: float,
+        TP: float,
+        LRA: float,
+        postfilter: Optional[str],
+        out_wav: str
+    ) -> None:
+        """
+        For Opus: measure loudness after denoise (pass1), then apply fixed loudnorm (pass2).
+        We keep everything mono/48k PCM to be consistent with the rest of the pipeline.
+        """
+        # ---- Pass 1: measure ----
+        # Build filter: prefilter -> loudnorm (measure only)
+        ln_measure = f"loudnorm=I={I}:TP={TP}:LRA={LRA}:print_format=json"
+        filt1 = f"{prefilter},{ln_measure}" if prefilter else ln_measure
+
+        run1 = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                "-i", src,
+                "-af", filt1,
+                "-ar", "48000", "-ac", "1",
+                "-f", "null", "-"
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        stats = _parse_loudnorm_json(run1.stderr or "")
+        if not stats:
+            # If we failed to parse stats, fall back to single-pass on Opus with limiter.
+            fallback = f"{prefilter},loudnorm=I={I}:TP={TP}:LRA={LRA}"
+            if postfilter:
+                fallback = f"{fallback},{postfilter}"
+            cmd_fb = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", src, "-af", fallback,
+                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
+            ]
+            run_fb = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if run_fb.returncode != 0:
+                raise RuntimeError("ffmpeg processing (fallback) failed.")
+            return
+
+        # ---- Pass 2: apply ----
+        # Plug measured_* and offset into loudnorm and add a limiter.
+        ln_apply = (
+            "loudnorm="
+            f"I={I}:TP={TP}:LRA={LRA}:"
+            f"measured_I={stats['measured_I']:.3f}:"
+            f"measured_LRA={stats['measured_LRA']:.3f}:"
+            f"measured_TP={stats['measured_TP']:.3f}:"
+            f"measured_thresh={stats['measured_thresh']:.3f}:"
+            f"offset={stats['offset']:.3f}:"
+            "linear=true:print_format=summary"
+        )
+
+        chain = f"{prefilter},{ln_apply}"
+        if postfilter:
+            chain = f"{chain},{postfilter}"
+
+        run2 = subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", src,
+                "-af", chain,
+                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if run2.returncode != 0:
+            raise RuntimeError("ffmpeg processing (pass2) failed.")
 
     def _load_wav(self, wav_path: str) -> None:
         with contextlib.closing(wave.open(wav_path, 'rb')) as wf:
