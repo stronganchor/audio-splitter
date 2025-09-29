@@ -1,632 +1,574 @@
-# ui.py
-# Tkinter UI for interactive splitting: visualize waveform, auto-detect splits,
-# shade Speech/Silence, tweak thresholds live, drag boundaries, play/export,
-# and (optionally) transcribe+rename.
+# processor.py
+# Core audio processing: ffmpeg preprocessing, silence detection, speech segment
+# inversion/merging, boundary snapping to local minima, and optional transcription.
 
 import os
+import re
 import math
+import wave
+import atexit
+import shutil
+import json
+import tempfile
 import subprocess
-from typing import List, Tuple, Optional
+import contextlib
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
+# --- Optional deps (both are optional and the code degrades gracefully) ---
+try:
+    import assemblyai as aai  # pip install assemblyai
+except Exception:  # pragma: no cover
+    aai = None
 
-from processor import AudioProcessor, ffplay_available
-
-# ---- UI defaults ----
-DEFAULT_USE_MORE_NOISE_REDUCTION = True
-DEFAULT_TARGET_LUFS = -18.0
-DEFAULT_MIN_SILENCE = 0.40
-DEFAULT_THRESHOLD_DB = -35
-DEFAULT_HYST_DB = 8
-DEFAULT_MIN_SEGMENT = 0.25
-DEFAULT_MIN_GAP = 0.20
-DEFAULT_VIEW_WIDTH = 20.0
-
-BOUNDARY_SELECT_TOLERANCE_PX = 6
-ALT_SEGMENT_SHADE_ALPHA = 0.10
-SELECTED_SEGMENT_ALPHA = 0.25
-
-HEAD_BUFFER = 0.02  # seconds to keep before start on export
-TAIL_BUFFER = 0.15  # seconds to keep after end on export
+try:
+    from unidecode import unidecode  # pip install Unidecode
+except Exception:  # pragma: no cover
+    def unidecode(s: str) -> str:
+        return s
 
 
-def time_to_str(t: float) -> str:
-    m = int(max(0.0, t) // 60)
-    s = max(0.0, t) - 60 * m
-    return f"{m:02d}:{s:06.3f}"
+# --------------------------- Defaults / Tunables ---------------------------
+
+LESS_NOISE_REDUCTION_LEVEL = -50  # dB for afftdn noise floor (gentler)
+MORE_NOISE_REDUCTION_LEVEL = -30  # dB for afftdn noise floor (stronger)
+DEFAULT_TARGET_LUFS = -18.0       # loudnorm target
+
+# Boundary snapping window (seconds) used when aligning to local RMS minima
+SNAP_WINDOW = 0.12
 
 
-class SplitterUI(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title("Interactive Audio Splitter")
-        self.geometry("1180x720")
+# ------------------------------- Data Types -------------------------------
 
-        # Engine
-        self.processor = AudioProcessor()
+@dataclass
+class TranscriptWord:
+    text: str
+    start: float  # seconds
+    end: float    # seconds
 
-        # State
-        self.boundaries: List[float] = []               # [t0, t1, ...]
-        self.drag_idx: Optional[int] = None             # boundary being dragged
-        self.selected_seg_idx: Optional[int] = None     # selected interval index
-        self.envelope_x: Optional[np.ndarray] = None
-        self.envelope_y: Optional[np.ndarray] = None
-        self.play_proc: Optional[subprocess.Popen] = None
-        self.current_segments: List[Tuple[float, float]] = []
-        self.first_interval_is_segment: bool = True     # parity helper
 
-        # Controls state
-        self.var_view_width = tk.DoubleVar(value=DEFAULT_VIEW_WIDTH)
-        self.var_view_start = tk.DoubleVar(value=0.0)
+@dataclass
+class TranscriptData:
+    words: List[TranscriptWord]
 
-        self.var_more_noise = tk.BooleanVar(value=DEFAULT_USE_MORE_NOISE_REDUCTION)
-        self.var_lufs = tk.DoubleVar(value=DEFAULT_TARGET_LUFS)
-        self.var_detector = tk.StringVar(value="Energy")            # Energy | FFmpeg
-        self.var_min_sil = tk.DoubleVar(value=DEFAULT_MIN_SILENCE)
-        self.var_thresh = tk.IntVar(value=DEFAULT_THRESHOLD_DB)
-        self.var_hyst = tk.IntVar(value=DEFAULT_HYST_DB)
-        self.var_min_gap = tk.DoubleVar(value=DEFAULT_MIN_GAP)
-        self.var_min_seg = tk.DoubleVar(value=DEFAULT_MIN_SEGMENT)
-        self.var_format = tk.StringVar(value="mp3")
-        self.var_bitrate = tk.StringVar(value="192k")
-        self.var_lang = tk.StringVar(value="en")
-        self.var_segments_mode = tk.StringVar(value="Speech")       # Speech | Silence
 
-        # Build UI
-        self._build_controls()
-        self._build_plot()
+# ------------------------------- Utilities --------------------------------
 
-        # Events
-        self.bind("<<ViewChanged>>", lambda e: self._apply_view_limits())
-        self.canvas.mpl_connect("scroll_event", self._on_scroll_event)
-        self.canvas.mpl_connect("button_press_event", self.on_plot_click)
-        self.canvas.mpl_connect("button_release_event", self.on_plot_release)
-        self.canvas.mpl_connect("motion_notify_event", self.on_plot_motion)
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        self._set_status("Load an audio/video file to begin.")
-
-    # ------------------- Layout -------------------
-
-    def _build_controls(self) -> None:
-        frm = ttk.Frame(self)
-        frm.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
-
-        ttk.Button(frm, text="Load File…", command=self.on_load_file).grid(row=0, column=0, padx=4)
-
-        ttk.Label(frm, text="Noise:").grid(row=0, column=1, sticky="e")
-        ttk.Checkbutton(frm, text="More (−30 dB)", variable=self.var_more_noise).grid(row=0, column=2, padx=2)
-
-        ttk.Label(frm, text="Target LUFS:").grid(row=0, column=3, sticky="e")
-        ttk.Entry(frm, width=6, textvariable=self.var_lufs).grid(row=0, column=4, padx=2)
-
-        ttk.Label(frm, text="Segments:").grid(row=0, column=5, sticky="e")
-        cmb_mode = ttk.Combobox(
-            frm, width=8, textvariable=self.var_segments_mode,
-            values=["Speech", "Silence"], state="readonly"
+def ffmpeg_exists() -> bool:
+    """Return True if ffmpeg is available on PATH."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
         )
-        cmb_mode.grid(row=0, column=6, padx=2)
-        cmb_mode.bind("<<ComboboxSelected>>", lambda e: self.on_detection_param_change())
+        return True
+    except Exception:
+        return False
 
-        ttk.Button(frm, text="Process/Visualize", command=self.on_process).grid(row=0, column=7, padx=6)
 
-        # Detector row
-        ttk.Label(frm, text="Detector:").grid(row=1, column=0, sticky="e")
-        cmb_det = ttk.Combobox(frm, width=10, textvariable=self.var_detector,
-                               values=["Energy", "FFmpeg"], state="readonly")
-        cmb_det.grid(row=1, column=1, padx=2)
-        cmb_det.bind("<<ComboboxSelected>>", lambda e: self.on_detection_param_change())
-
-        ttk.Label(frm, text="Min Silence (s):").grid(row=1, column=2, sticky="e")
-        ttk.Scale(frm, from_=0.05, to=1.50, variable=self.var_min_sil,
-                  command=self.on_detection_param_change).grid(row=1, column=3, sticky="we", padx=4)
-
-        ttk.Label(frm, text="Threshold (dBFS):").grid(row=1, column=4, sticky="e")
-        ttk.Scale(frm, from_=-80, to=-10, variable=self.var_thresh,
-                  command=self.on_detection_param_change).grid(row=1, column=5, sticky="we", padx=4)
-
-        ttk.Label(frm, text="Hysteresis (dB):").grid(row=1, column=6, sticky="e")
-        ttk.Scale(frm, from_=2, to=18, variable=self.var_hyst,
-                  command=self.on_detection_param_change).grid(row=1, column=7, sticky="we", padx=4)
-
-        ttk.Label(frm, text="Min Gap (s):").grid(row=1, column=8, sticky="e")
-        ttk.Scale(frm, from_=0.05, to=1.00, variable=self.var_min_gap,
-                  command=self.on_detection_param_change).grid(row=1, column=9, sticky="we", padx=4)
-
-        ttk.Label(frm, text="Min Segment (s):").grid(row=1, column=10, sticky="e")
-        ttk.Scale(frm, from_=0.10, to=2.00, variable=self.var_min_seg,
-                  command=lambda e: self._refresh_plot(True)).grid(row=1, column=11, sticky="we", padx=4)
-
-        ttk.Button(frm, text="Auto-Detect Splits", command=lambda: self.auto_detect(True)).grid(row=1, column=12, padx=4)
-
-        # Export + playback + transcription
-        ttk.Label(frm, text="Export as:").grid(row=2, column=0, sticky="e")
-        ttk.Combobox(frm, width=6, textvariable=self.var_format,
-                     values=["mp3", "wav"], state="readonly").grid(row=2, column=1, padx=2)
-
-        ttk.Label(frm, text="Bitrate (mp3):").grid(row=2, column=2, sticky="e")
-        ttk.Entry(frm, width=7, textvariable=self.var_bitrate).grid(row=2, column=3, padx=2)
-
-        ttk.Button(frm, text="Export Segments…", command=self.export_segments).grid(row=2, column=4, padx=4)
-        ttk.Button(frm, text="Play Selected", command=self.play_selected_segment).grid(row=2, column=5, padx=4)
-        ttk.Button(frm, text="Stop", command=self.stop_playback).grid(row=2, column=6, padx=4)
-
-        ttk.Label(frm, text="Lang:").grid(row=2, column=7, sticky="e")
-        ttk.Entry(frm, width=5, textvariable=self.var_lang).grid(row=2, column=8, padx=2)
-        ttk.Button(frm, text="Transcribe & Rename", command=self.transcribe_and_rename).grid(row=2, column=9, padx=4)
-
-        self.status = ttk.Label(frm, text="", anchor="w")
-        self.status.grid(row=3, column=0, columnspan=13, sticky="we", pady=(6, 0))
-
-        ttk.Label(
-            self, anchor="w",
-            text=("Tips: Click inside segment to select • Double-click to play • "
-                  "SHIFT+Click add boundary • CTRL+Click a line to delete • "
-                  "Drag a red line to adjust • Mouse wheel = horizontal scroll • "
-                  "Zoom via View controls")
-        ).pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
-
-        # View controls
-        view = ttk.Frame(self)
-        view.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
-        ttk.Label(view, text="View (s):").grid(row=0, column=0, sticky="e")
-        self.sld_view_w = ttk.Scale(
-            view, from_=5, to=90, variable=self.var_view_width,
-            command=lambda e: self._on_view_changed()
+def ffplay_available() -> bool:
+    """Return True if ffplay (for playback) is available on PATH."""
+    try:
+        subprocess.run(
+            ["ffplay", "-hide_banner", "-version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
         )
-        self.sld_view_w.grid(row=0, column=1, sticky="we", padx=6)
+        return True
+    except Exception:
+        return False
 
-        ttk.Label(view, text="Start (s):").grid(row=0, column=2, sticky="e")
-        self.sld_view_start = ttk.Scale(
-            view, from_=0, to=1, variable=self.var_view_start,
-            command=lambda e: self._on_view_changed()
-        )
-        self.sld_view_start.grid(row=0, column=3, sticky="we", padx=6)
-        view.columnconfigure(1, weight=1)
-        view.columnconfigure(3, weight=1)
 
-    def _build_plot(self) -> None:
-        self.fig = Figure(figsize=(9.6, 3.2), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Waveform (processed)")
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Amplitude")
-        self.ax.grid(True, alpha=0.2)
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
-        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-    def _set_status(self, msg: str) -> None:
-        self.status.config(text=msg)
-        self.update_idletasks()
-
-    # ------------------- Actions -------------------
-
-    def on_load_file(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select audio/video file",
-            filetypes=[
-                ("Media", "*.wav;*.mp3;*.m4a;*.aac;*.flac;*.ogg;*.opus;*.mp4;*.mkv;*.mov;*.avi"),
-                ("All", "*.*"),
+def _ffprobe_codec_name(path: str) -> Optional[str]:
+    """
+    Return codec_name for the first audio stream using ffprobe, or None on failure.
+    """
+    try:
+        run = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=nw=1:nk=1",
+                path,
             ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
-        if not path:
-            return
-        self.processor.input_path = path
-        self._set_status(f"Selected: {path}")
+        if run.returncode == 0:
+            name = (run.stdout or "").strip().lower()
+            return name or None
+    except Exception:
+        pass
+    return None
 
-    def on_process(self) -> None:
-        if not self.processor.input_path:
-            messagebox.showinfo("No file", "Please choose a file first.")
-            return
 
-        self._set_status("Processing with noise reduction + loudness normalization…")
-        self.processor.load_and_process(
-            self.processor.input_path,
-            use_more_noise=self.var_more_noise.get(),
-            target_lufs=float(self.var_lufs.get()),
-        )
-
-        # Build a light-weight envelope for plotting (decimated)
-        x = self.processor.samples
-        sr = self.processor.sample_rate
-        if x is not None and sr is not None:
-            max_points = 8000
-            n = len(x)
-            if n <= max_points:
-                self.envelope_x = np.linspace(0, self.processor.duration, n)
-                self.envelope_y = x
-            else:
-                bin_size = int(math.ceil(n / max_points))
-                trimmed = x[: (n // bin_size) * bin_size]
-                y = trimmed.reshape(-1, bin_size)
-                y = np.max(np.abs(y), axis=1) * np.sign(np.sum(y, axis=1))
-                self.envelope_x = np.linspace(0, self.processor.duration, len(y))
-                self.envelope_y = y
-
-        self.boundaries = [0.0, self.processor.duration]
-        self.selected_seg_idx = None
-        self.current_segments = []
-        self.first_interval_is_segment = True
-
-        self.var_view_start.set(0.0)
-        self._update_view_slider_range()
-        self._refresh_plot(False)
-        self._apply_view_limits()
-
-        self._set_status("Processed. Use Auto-Detect or add boundaries manually.")
-
-    def on_detection_param_change(self, _evt=None) -> None:
-        if self.processor.processed_wav:
-            self.auto_detect(True)
-
-    # ------------------- Auto detect & Plot -------------------
-
-    def auto_detect(self, preserve_view: bool = True) -> None:
-        if not self.processor.processed_wav:
-            return
-
-        cur_xlim = self.ax.get_xlim()
-
-        thr = int(self.var_thresh.get())
-        min_sil = float(self.var_min_sil.get())
-        hyst = int(self.var_hyst.get())
-        min_gap = float(self.var_min_gap.get())
-        min_seg = float(self.var_min_seg.get())
-        mode = self.var_detector.get()
-        seg_mode = self.var_segments_mode.get()  # "Speech" | "Silence"
-
-        # 1) Detect silences
-        if mode == "FFmpeg":
-            silences = self.processor.detect_silences_ffmpeg(threshold_db=thr, min_silence=min_sil)
-        else:
-            silences = self.processor.detect_silences_energy(
-                threshold_db=thr, min_silence=min_sil, hysteresis_db=hyst
-            )
-
-        # 2) Convert to segments based on chosen mode
-        if seg_mode == "Speech":
-            segs = self.processor.invert_to_speech_segments(silences, min_seg=min_seg, min_gap=min_gap)
-        else:
-            segs = [(s, e) for s, e in silences if (e - s) >= min_gap] or [(0.0, self.processor.duration)]
-
-        # 3) Snap boundaries to local minima
-        segs = self.processor.snap_times_to_minima(segs)
-
-        # 4) Convert segments -> boundary list and figure out parity
-        self.current_segments = segs[:]
-        bounds = [segs[0][0]]
-        for a, b in segs:
-            if not bounds or abs(a - bounds[-1]) > 1e-3:
-                bounds.append(a)
-            bounds.append(b)
-        bounds = [max(0.0, min(self.processor.duration, t)) for t in bounds]
-
-        first_is_segment = True
-        if bounds and bounds[0] > 0.0:
-            first_is_segment = False
-            bounds = [0.0] + bounds
-        if not bounds or bounds[-1] < self.processor.duration:
-            bounds.append(self.processor.duration)
-
-        self.boundaries = bounds
-        self.first_interval_is_segment = first_is_segment
-        self.selected_seg_idx = None
-
-        self._refresh_plot(True)
-        if preserve_view:
-            self.ax.set_xlim(*cur_xlim)
-            self.canvas.draw_idle()
-
-        self._set_status(f"Found {len(self.current_segments)} segment(s).")
-
-    def _interval_is_segment(self, i: int) -> bool:
-        return (i % 2 == 0) if self.first_interval_is_segment else (i % 2 == 1)
-
-    def _refresh_plot(self, preserve_xlim: bool = True) -> None:
-        cur_xlim = self.ax.get_xlim() if preserve_xlim else None
-
-        self.ax.clear()
-        self.ax.set_title("Waveform (processed)")
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Amplitude")
-        self.ax.grid(True, alpha=0.2)
-
-        if self.envelope_x is not None and self.envelope_y is not None:
-            self.ax.plot(self.envelope_x, self.envelope_y, linewidth=0.7)
-
-        if self.boundaries and len(self.boundaries) >= 2:
-            # Shade only the chosen segments; gaps remain white
-            for i in range(len(self.boundaries) - 1):
-                a = self.boundaries[i]
-                b = self.boundaries[i + 1]
-                if self._interval_is_segment(i):
-                    alpha = SELECTED_SEGMENT_ALPHA if (self.selected_seg_idx == i) else ALT_SEGMENT_SHADE_ALPHA
-                    self.ax.axvspan(a, b, alpha=alpha)
-            # Draw boundaries
-            for b in self.boundaries:
-                self.ax.axvline(b, color="r", linewidth=1.2, alpha=0.85)
-
-        self.ax.set_ylim(-1.05, 1.05)
-        if cur_xlim is not None:
-            self.ax.set_xlim(*cur_xlim)
-        elif self.processor.duration:
-            self.ax.set_xlim(0, self.processor.duration)
-
-        self.canvas.draw_idle()
-
-    # ------------------- Mouse / Selection -------------------
-
-    def _nearest_boundary_idx(self, xdata: float, px_tol: int = BOUNDARY_SELECT_TOLERANCE_PX) -> Optional[int]:
-        if not self.boundaries:
-            return None
-        trans = self.ax.transData.transform
-        px_per_sec = abs(trans((xdata + 1.0, 0.0))[0] - trans((xdata, 0.0))[0])
-        tol_sec = px_tol / px_per_sec if px_per_sec > 0 else 0.02
-        diffs = [abs(b - xdata) for b in self.boundaries]
-        idx = int(np.argmin(diffs))
-        return idx if diffs[idx] <= tol_sec else None
-
-    def _segment_index_at_time(self, t: float) -> Optional[int]:
-        if not self.boundaries or len(self.boundaries) < 2:
-            return None
-        for i in range(len(self.boundaries) - 1):
-            if self.boundaries[i] <= t <= self.boundaries[i + 1]:
-                return i if self._interval_is_segment(i) else None
+def _parse_loudnorm_json(stderr_text: str) -> Optional[Dict[str, float]]:
+    """
+    Parse ffmpeg loudnorm print_format=json output and return the fields needed for pass2.
+    Returns dict with keys: measured_I, measured_LRA, measured_TP, measured_thresh, offset
+    """
+    # Try to find a JSON block. loudnorm writes it to stderr.
+    # We look for the last {...} block to be safe.
+    blocks = re.findall(r"\{.*?\}", stderr_text, flags=re.DOTALL)
+    if not blocks:
         return None
-
-    def on_plot_click(self, event) -> None:
-        if event.inaxes != self.ax or not self.processor.processed_wav:
-            return
-
-        x = float(event.xdata)
-
-        # Add boundary
-        if event.key == "shift":
-            self.boundaries.append(max(0.0, min(self.processor.duration, x)))
-            self.boundaries = sorted(set(self.boundaries))
-            self.selected_seg_idx = self._segment_index_at_time(x)
-            self._refresh_plot(True)
-            self._set_status(f"Added boundary at {time_to_str(x)}")
-            return
-
-        # Delete boundary
-        if event.key == "control":
-            idx = self._nearest_boundary_idx(x)
-            if idx is not None and 0 < idx < len(self.boundaries) - 1:
-                val = self.boundaries.pop(idx)
-                self.selected_seg_idx = self._segment_index_at_time(x)
-                self._refresh_plot(True)
-                self._set_status(f"Deleted boundary at {time_to_str(val)}")
-            return
-
-        # Drag boundary
-        idx = self._nearest_boundary_idx(x)
-        if idx is not None and 0 < idx < len(self.boundaries) - 1:
-            self.drag_idx = idx
-            self._set_status(f"Dragging boundary #{idx} @ {time_to_str(self.boundaries[idx])}")
-            return
-
-        # Select segment
-        seg = self._segment_index_at_time(x)
-        if seg is not None:
-            self.selected_seg_idx = seg
-            self._refresh_plot(True)
-            a, b = self.boundaries[seg], self.boundaries[seg + 1]
-            self._set_status(f"Selected segment #{seg + 1}: {time_to_str(a)} – {time_to_str(b)}")
-
-    def on_plot_motion(self, event) -> None:
-        if self.drag_idx is None or event.inaxes != self.ax:
-            return
-        x = float(event.xdata)
-        lo = self.boundaries[self.drag_idx - 1] + 0.01
-        hi = self.boundaries[self.drag_idx + 1] - 0.01
-        x = max(lo, min(hi, x))
-        self.boundaries[self.drag_idx] = x
-        self.selected_seg_idx = self._segment_index_at_time(x)
-        self._refresh_plot(True)
-
-    def on_plot_release(self, event) -> None:
-        if self.drag_idx is not None:
-            self._set_status(f"Boundary #{self.drag_idx} set to {time_to_str(self.boundaries[self.drag_idx])}")
-        self.drag_idx = None
-
-    # ------------------- Playback & Export -------------------
-
-    def play_selected_segment(self) -> None:
-        if self.selected_seg_idx is None or not self.processor.processed_wav:
-            messagebox.showinfo("No selection", "Click a segment to select it.")
-            return
-        if not ffplay_available():
-            messagebox.showinfo("Missing ffplay", "Install ffplay (part of ffmpeg) to enable playback.")
-            return
-
-        a = self.boundaries[self.selected_seg_idx]
-        b = self.boundaries[self.selected_seg_idx + 1]
-        dur = max(0.05, b - a)
-
-        self.stop_playback()
-        self.play_proc = subprocess.Popen(
-            ["ffplay", "-nodisp", "-autoexit", "-hide_banner", "-loglevel", "error",
-             "-ss", f"{a:.3f}", "-t", f"{dur:.3f}", self.processor.processed_wav],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        self._set_status(f"Playing segment ({time_to_str(a)} – {time_to_str(b)})")
-
-    def stop_playback(self) -> None:
-        if self.play_proc and self.play_proc.poll() is None:
-            try:
-                self.play_proc.terminate()
-            except Exception:
-                pass
-        self.play_proc = None
-
-    def export_segments(self) -> None:
-        if not self.processor.processed_wav:
-            messagebox.showinfo("No audio", "Process a file first.")
-            return
-        if len(self.boundaries) < 2:
-            messagebox.showinfo("No segments", "No boundaries defined.")
-            return
-    
-        out_dir = filedialog.askdirectory(title="Choose output folder")
-        if not out_dir:
-            return
-    
-        fmt = self.var_format.get().lower()
-        bitrate = self.var_bitrate.get()
-        src = self.processor.processed_wav
-    
-        count = 0
-        for i in range(len(self.boundaries) - 1):
-            if not self._interval_is_segment(i):
-                continue  # export only true segments
-    
-            a = max(0.0, self.boundaries[i] - HEAD_BUFFER)
-            b = min(self.processor.duration, self.boundaries[i + 1] + TAIL_BUFFER)
-            if b <= a + 0.01:
-                continue
-    
-            dur = b - a
-    
-            # Short micro-fades to prevent clicks; clamp for very short clips
-            fd = min(0.006, max(0.0, dur * 0.25))
-            fade_out_start = max(0.0, dur - fd)
-    
-            # Trim inside the filtergraph (no -ss/-t ambiguity), then reset PTS and fade
-            filt = (
-                f"atrim=start={a:.6f}:end={b:.6f},"
-                f"asetpts=PTS-STARTPTS,"
-                f"afade=t=in:st=0:d={fd:.4f},"
-                f"afade=t=out:st={fade_out_start:.4f}:d={fd:.4f}"
-            )
-    
-            ext = "wav" if fmt == "wav" else "mp3"
-            out_path = os.path.join(out_dir, f"segment_{i + 1:03d}.{ext}")
-    
-            cmd = [
-                "ffmpeg", "-y",
-                "-hide_banner", "-loglevel", "error",
-                "-i", src,
-                "-af", filt,
-            ]
-    
-            if fmt == "wav":
-                cmd += ["-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_path]
-            else:
-                cmd += ["-ar", "48000", "-ac", "1", "-c:a", "libmp3lame", "-b:a", bitrate, out_path]
-    
-            run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if run.returncode == 0:
-                count += 1
-    
-        self._set_status(f"Exported {count} segment(s) to: {out_dir}")
-        messagebox.showinfo("Export complete", f"Exported {count} segment(s) to:\n{out_dir}")
-    
-    # ------------------- Transcription & Rename -------------------
-
-    def transcribe_and_rename(self) -> None:
-        # Soft-fail if not configured
-        if os.getenv("ASSEMBLYAI_API_KEY") is None:
-            messagebox.showinfo(
-                "Transcription not configured",
-                "Set ASSEMBLYAI_API_KEY in your environment to enable automatic renaming.")
-            return
-        if not self.processor.processed_wav or len(self.boundaries) < 2:
-            messagebox.showinfo("No segments", "Process and split the audio first.")
-            return
-
-        lang = self.var_lang.get().strip() or "en"
-        tr = self.processor.transcribe(language_code=lang)
-        if tr is None or not tr.words:
-            messagebox.showinfo("Transcription", "No words returned. Keeping default names.")
-            return
-
-        seg_dir = filedialog.askdirectory(title="Choose the folder with exported segments")
-        if not seg_dir:
-            return
-
-        words = self.processor.transcript.words  # type: ignore
-
-        def sanitize(name: str) -> str:
-            import re
-            name = re.sub(r'[<>:"/\\|?*\n\r\t]+', " ", name).strip()
-            name = re.sub(r"\s+", " ", name)
-            return name or "segment"
-
-        for i in range(len(self.boundaries) - 1):
-            a = self.boundaries[i]
-            b = self.boundaries[i + 1]
-            seg_words = [w.text for w in words if (w.end >= a - 0.10 and w.start <= b + 0.10)]
-            base = sanitize(" ".join(seg_words[:8])) if seg_words else f"segment_{i + 1:03d}"
-
-            cand_mp3 = os.path.join(seg_dir, f"segment_{i + 1:03d}.mp3")
-            cand_wav = os.path.join(seg_dir, f"segment_{i + 1:03d}.wav")
-            old = cand_mp3 if os.path.exists(cand_mp3) else cand_wav if os.path.exists(cand_wav) else None
-            if not old:
-                continue
-
-            ext = os.path.splitext(old)[1].lower()
-            new = os.path.join(seg_dir, f"{base}{ext}")
-
-            k = 1
-            final = new
-            while os.path.exists(final):
-                final = os.path.join(seg_dir, f"{base}_{k}{ext}")
-                k += 1
-
-            try:
-                os.replace(old, final)
-            except Exception:
-                pass
-
-        messagebox.showinfo("Done", f"Renamed segments in:\n{seg_dir}")
-
-    # ------------------- View / Zoom -------------------
-
-    def _update_view_slider_range(self) -> None:
-        dur = self.processor.duration or 0.0
-        width = float(self.var_view_width.get())
-        max_start = max(0.0, dur - width)
-        self.sld_view_start.configure(from_=0.0, to=max_start)
-
-    def _apply_view_limits(self) -> None:
-        dur = self.processor.duration or 0.0
-        width = float(self.var_view_width.get())
-        start = float(self.var_view_start.get())
-        start = max(0.0, min(start, max(0.0, dur - width)))
-        end = start + width
-        self.ax.set_xlim(start, min(end, max(dur, width)))
-        self.canvas.draw_idle()
-
-    def _on_view_changed(self) -> None:
-        self._update_view_slider_range()
-        self.event_generate("<<ViewChanged>>", when="tail")
-
-    def _on_scroll_event(self, event) -> None:
-        if not self.processor.duration:
-            return
-        width = float(self.var_view_width.get())
-        delta = -np.sign(event.step) * (0.10 * width)  # 10% per wheel notch
-        new_start = float(self.var_view_start.get()) + delta
-        self.var_view_start.set(max(0.0, min(new_start, max(0.0, self.processor.duration - width))))
-        self._apply_view_limits()
-
-    # ------------------- Shutdown -------------------
-
-    def on_close(self) -> None:
+    for blob in reversed(blocks):
         try:
-            self.stop_playback()
-        finally:
-            self.destroy()
+            data = json.loads(blob)
+            # ffmpeg may emit as strings; coerce to float
+            need = ["input_i", "input_tp", "input_lra", "input_thresh",
+                    "target_offset", "measured_i", "measured_lra", "measured_tp", "measured_thresh", "offset"]
+            present = {k.lower(): v for k, v in data.items()}
+            # Normalize keys
+            def fget(*keys):
+                for k in keys:
+                    v = present.get(k)
+                    if v is not None:
+                        return float(v)
+                return None
+
+            measured = {
+                "measured_I": fget("measured_i", "input_i"),
+                "measured_LRA": fget("measured_lra", "input_lra"),
+                "measured_TP": fget("measured_tp", "input_tp"),
+                "measured_thresh": fget("measured_thresh", "input_thresh"),
+                "offset": fget("offset", "target_offset", "normalization_offset"),
+            }
+            if all(v is not None for v in measured.values()):
+                return measured  # type: ignore
+        except Exception:
+            continue
+    return None
 
 
-# Small launcher convenience (so you can run `python ui.py` directly)
-if __name__ == "__main__":
-    app = SplitterUI()
-    app.mainloop()
+# ------------------------------ Core Engine --------------------------------
+
+class AudioProcessor:
+    """
+    Handles:
+      - Preprocessing via ffmpeg: noise reduction (afftdn) + loudness normalization (loudnorm)
+      - Wave loading and RMS envelope calculation
+      - Silence detection (ffmpeg silencedetect OR RMS energy with hysteresis)
+      - Converting silences -> speech segments and merging tiny segments
+      - Snapping segment boundaries to local RMS minima
+      - Optional transcription with AssemblyAI (if ASSEMBLYAI_API_KEY is set)
+    """
+
+    def __init__(self) -> None:
+        self.input_path: Optional[str] = None
+        self.temp_dir = tempfile.mkdtemp(prefix="audio_split_ui_")
+        atexit.register(self.cleanup)
+
+        # Results of processing
+        self.processed_wav: Optional[str] = None  # mono, 48k, pcm_s16le
+        self.sample_rate: Optional[int] = None
+        self.samples: Optional[np.ndarray] = None  # mono float32 [-1..1]
+        self.duration: float = 0.0
+
+        # RMS envelope (used by energy detector + snapping)
+        self.rms_db: Optional[np.ndarray] = None
+        self.rms_hop_sec: float = 0.010  # hop size (s)
+
+        # Optional transcript
+        self.transcript: Optional[TranscriptData] = None
+
+    # -- lifecycle --
+
+    def cleanup(self) -> None:
+        try:
+            if os.path.isdir(self.temp_dir):
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    # -- preprocessing --
+
+    def load_and_process(self, path: str, use_more_noise: bool, target_lufs: float) -> None:
+        """
+        Run ffmpeg with noise reduction + loudnorm, convert to mono 48k WAV.
+        For Opus inputs: use gentler denoise, two-pass loudnorm (measure→apply), and a limiter.
+        Populates: processed_wav, sample_rate, samples, duration, rms_db.
+        """
+        if not ffmpeg_exists():
+            raise RuntimeError("ffmpeg was not found in PATH.")
+
+        self.input_path = path
+        codec = (_ffprobe_codec_name(path) or "").lower()
+
+        # Decide noise reduction level and pre/post filters
+        if codec == "opus":
+            # Opus-specific: lighter denoise to avoid "musical noise",
+            # keep low-frequency rumble out of loudnorm, and limit overshoot.
+            nf = max(LESS_NOISE_REDUCTION_LEVEL, -48)  # gentle
+            pre = f"highpass=f=60,afftdn=nf={nf}"
+            # Loudnorm as two-pass on the denoised signal, then limiter
+            out_wav = os.path.join(self.temp_dir, "processed.wav")
+            self._process_with_two_pass_loudnorm(
+                src=path,
+                prefilter=pre,
+                I=target_lufs,
+                TP=-2.0,
+                LRA=11.0,
+                postfilter="alimiter=limit=-1.0:level=true",
+                out_wav=out_wav
+            )
+        else:
+            # Non-Opus: keep previous single-pass flow
+            nf = MORE_NOISE_REDUCTION_LEVEL if use_more_noise else LESS_NOISE_REDUCTION_LEVEL
+            out_wav = os.path.join(self.temp_dir, "processed.wav")
+            filter_chain = f"afftdn=nf={nf},loudnorm=I={target_lufs}:TP=-2:LRA=11"
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", path,
+                "-af", filter_chain,
+                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
+            ]
+            run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if run.returncode != 0:
+                raise RuntimeError("ffmpeg processing failed.")
+
+        self.processed_wav = out_wav
+        self._load_wav(out_wav)
+        self._compute_rms_db()
+
+    def _process_with_two_pass_loudnorm(
+        self,
+        src: str,
+        prefilter: str,
+        I: float,
+        TP: float,
+        LRA: float,
+        postfilter: Optional[str],
+        out_wav: str
+    ) -> None:
+        """
+        For Opus: measure loudness after denoise (pass1), then apply fixed loudnorm (pass2).
+        We keep everything mono/48k PCM to be consistent with the rest of the pipeline.
+        """
+        # ---- Pass 1: measure ----
+        # Build filter: prefilter -> loudnorm (measure only)
+        ln_measure = f"loudnorm=I={I}:TP={TP}:LRA={LRA}:print_format=json"
+        filt1 = f"{prefilter},{ln_measure}" if prefilter else ln_measure
+
+        run1 = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                "-i", src,
+                "-af", filt1,
+                "-ar", "48000", "-ac", "1",
+                "-f", "null", "-"
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        stats = _parse_loudnorm_json(run1.stderr or "")
+        if not stats:
+            # If we failed to parse stats, fall back to single-pass on Opus with limiter.
+            fallback = f"{prefilter},loudnorm=I={I}:TP={TP}:LRA={LRA}"
+            if postfilter:
+                fallback = f"{fallback},{postfilter}"
+            cmd_fb = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", src, "-af", fallback,
+                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
+            ]
+            run_fb = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if run_fb.returncode != 0:
+                raise RuntimeError("ffmpeg processing (fallback) failed.")
+            return
+
+        # ---- Pass 2: apply ----
+        # Plug measured_* and offset into loudnorm and add a limiter.
+        ln_apply = (
+            "loudnorm="
+            f"I={I}:TP={TP}:LRA={LRA}:"
+            f"measured_I={stats['measured_I']:.3f}:"
+            f"measured_LRA={stats['measured_LRA']:.3f}:"
+            f"measured_TP={stats['measured_TP']:.3f}:"
+            f"measured_thresh={stats['measured_thresh']:.3f}:"
+            f"offset={stats['offset']:.3f}:"
+            "linear=true:print_format=summary"
+        )
+
+        chain = f"{prefilter},{ln_apply}"
+        if postfilter:
+            chain = f"{chain},{postfilter}"
+
+        run2 = subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", src,
+                "-af", chain,
+                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if run2.returncode != 0:
+            raise RuntimeError("ffmpeg processing (pass2) failed.")
+
+    def _load_wav(self, wav_path: str) -> None:
+        with contextlib.closing(wave.open(wav_path, 'rb')) as wf:
+            sr = wf.getframerate()
+            ch = wf.getnchannels()
+            n = wf.getnframes()
+            self.sample_rate = sr
+            self.duration = n / float(sr)
+
+            frames = wf.readframes(n)
+            audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            if ch == 2:
+                audio = audio.reshape(-1, 2).mean(axis=1)  # downmix to mono
+            self.samples = audio
+
+    def _compute_rms_db(self) -> None:
+        """Compute a smoothed RMS envelope in dBFS (~10 ms hop, ~50 ms smoothing)."""
+        if self.samples is None or self.sample_rate is None:
+            return
+
+        x = self.samples
+        sr = self.sample_rate
+
+        win_sec = 0.020
+        hop_sec = 0.010
+        win = max(1, int(sr * win_sec))
+        hop = max(1, int(sr * hop_sec))
+
+        pad = (hop - (len(x) - win) % hop) % hop
+        xpad = np.pad(x, (0, pad), mode='constant')
+        n_frames = 1 + (len(xpad) - win) // hop
+
+        frames = np.lib.stride_tricks.as_strided(
+            xpad,
+            shape=(n_frames, win),
+            strides=(xpad.strides[0] * hop, xpad.strides[0])
+        )
+        rms = np.sqrt(np.maximum(1e-12, np.mean(frames * frames, axis=1)))
+        dbfs = 20.0 * np.log10(rms + 1e-12)
+
+        # smooth (moving average ~50 ms)
+        k = max(1, int(round(0.050 / hop_sec)))
+        if k > 1:
+            kernel = np.ones(k) / k
+            dbfs = np.convolve(dbfs, kernel, mode='same')
+
+        self.rms_db = dbfs
+        self.rms_hop_sec = hop_sec
+
+    # -- silence detection --
+
+    def detect_silences_ffmpeg(self, threshold_db: int, min_silence: float) -> List[Tuple[float, float]]:
+        """
+        Use ffmpeg's silencedetect to return a list of (start, end) silence pairs.
+        """
+        if not self.processed_wav:
+            return []
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-nostats", "-i", self.processed_wav,
+            "-af", f"silencedetect=noise={threshold_db}dB:d={min_silence}",
+            "-f", "null", "-"
+        ]
+        run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        text = run.stderr
+
+        starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", text)]
+        ends   = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", text)]
+
+        pairs: List[Tuple[float, float]] = []
+        ei = 0
+        for s in starts:
+            while ei < len(ends) and ends[ei] < s:
+                ei += 1
+            if ei < len(ends):
+                pairs.append((s, ends[ei]))
+                ei += 1
+            else:
+                # trailing open silence to EOF
+                pairs.append((s, self.duration))
+
+        return self._sanitize_pairs(pairs)
+
+    def detect_silences_energy(
+        self, threshold_db: int, min_silence: float, hysteresis_db: int
+    ) -> List[Tuple[float, float]]:
+        """
+        Silence detector using the RMS envelope with hysteresis:
+          - enter 'speech' when RMS >= (threshold + H/2)
+          - exit  'speech' when RMS <  (threshold - H/2) for at least min_silence
+        Returns (start, end) silence pairs.
+        """
+        if self.rms_db is None:
+            return []
+
+        db = self.rms_db
+        hop = self.rms_hop_sec
+
+        enter = threshold_db + hysteresis_db / 2.0
+        exit_ = threshold_db - hysteresis_db / 2.0
+
+        min_sil_frames = max(1, int(round(min_silence / hop)))
+        speech = False
+        sil_start_idx: Optional[int] = None
+        pairs: List[Tuple[float, float]] = []
+
+        i = 0
+        while i < len(db):
+            d = db[i]
+            if not speech:
+                if d >= enter:
+                    # close a preceding silence (if any)
+                    if sil_start_idx is not None:
+                        s = sil_start_idx * hop
+                        e = i * hop
+                        if e > s:
+                            pairs.append((s, min(self.duration, e)))
+                    sil_start_idx = None
+                    speech = True
+                else:
+                    if sil_start_idx is None:
+                        sil_start_idx = i
+            else:
+                # we're in speech; look for sustained quiet
+                if d < exit_:
+                    j = i
+                    while j < len(db) and db[j] < exit_ and (j - i) < min_sil_frames:
+                        j += 1
+                    if j - i >= min_sil_frames:
+                        s = i * hop
+                        e = j * hop
+                        pairs.append((s, min(self.duration, e)))
+                        speech = False
+                        sil_start_idx = j
+                        i = j
+                        continue
+            i += 1
+
+        if not speech and sil_start_idx is not None:
+            s = sil_start_idx * hop
+            e = self.duration
+            if e > s:
+                pairs.append((s, e))
+
+        return self._sanitize_pairs(pairs)
+
+    # -- conversion helpers --
+
+    def _sanitize_pairs(self, pairs: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """Clip to [0,duration], drop zero/negative spans, and merge overlaps."""
+        if not pairs:
+            return []
+        pairs = [(max(0.0, s), min(self.duration, e)) for s, e in pairs if e > s]
+        pairs.sort()
+        merged: List[Tuple[float, float]] = []
+        cs, ce = pairs[0]
+        for s, e in pairs[1:]:
+            if s <= ce + 1e-3:
+                ce = max(ce, e)
+            else:
+                merged.append((cs, ce))
+                cs, ce = s, e
+        merged.append((cs, ce))
+        return merged
+
+    def invert_to_speech_segments(
+        self, silences: List[Tuple[float, float]], min_seg: float, min_gap: float
+    ) -> List[Tuple[float, float]]:
+        """
+        Given (start,end) silence spans, return merged speech segments.
+        - Silences shorter than min_gap are ignored (not considered real splits).
+        - Speech segments shorter than min_seg are merged with the previous one.
+        """
+        if not silences:
+            return [(0.0, self.duration)]
+
+        silences = [(s, e) for s, e in silences if (e - s) >= min_gap]
+        silences = self._sanitize_pairs(silences)
+
+        segs: List[Tuple[float, float]] = []
+        cur = 0.0
+        for s, e in silences:
+            if s > cur:
+                segs.append((cur, s))
+            cur = e
+        if cur < self.duration:
+            segs.append((cur, self.duration))
+
+        merged: List[Tuple[float, float]] = []
+        for a, b in segs:
+            if not merged:
+                if b - a >= min_seg:
+                    merged.append((a, b))
+                continue
+            pa, pb = merged[-1]
+            if (b - a) < min_seg:
+                merged[-1] = (pa, b)
+            else:
+                merged.append((a, b))
+
+        return merged if merged else [(0.0, self.duration)]
+
+    def snap_times_to_minima(
+        self, segs: List[Tuple[float, float]], window: float = SNAP_WINDOW
+    ) -> List[Tuple[float, float]]:
+        """
+        For each boundary, snap to the nearest local minimum in the RMS curve
+        within ±window seconds (helps borders hug actual silence).
+        """
+        if self.rms_db is None:
+            return segs
+
+        hop = self.rms_hop_sec
+        db = self.rms_db
+
+        def nearest_min(t: float) -> float:
+            i = int(round(t / hop))
+            w = int(round(window / hop))
+            lo = max(0, i - w)
+            hi = min(len(db) - 1, i + w)
+            idx = lo + int(np.argmin(db[lo:hi + 1]))
+            return idx * hop
+
+        out: List[Tuple[float, float]] = []
+        for a, b in segs:
+            aa = max(0.0, min(nearest_min(a), self.duration))
+            bb = max(0.0, min(nearest_min(b), self.duration))
+            # If snapping collapses a very short span, keep originals.
+            if bb - aa < 0.05:
+                aa, bb = a, b
+            out.append((aa, bb))
+        return out
+
+    # -- optional transcription --
+
+    def transcribe(self, language_code: str = "en") -> Optional[TranscriptData]:
+        """
+        If AssemblyAI is available and ASSEMBLYAI_API_KEY is set, transcribe the
+        processed WAV and populate self.transcript with word-level timings.
+        Returns TranscriptData or None if unavailable.
+        """
+        if aai is None:
+            return None
+        api_key = os.getenv("ASSEMBLYAI_API_KEY")
+        if not api_key:
+            return None
+
+        aai.settings.api_key = api_key
+        cfg = aai.TranscriptionConfig(language_code=language_code)
+        transcriber = aai.Transcriber(config=cfg)
+        tr = transcriber.transcribe(self.processed_wav)
+
+        words: List[TranscriptWord] = []
+        try:
+            for w in tr.words or []:
+                words.append(
+                    TranscriptWord(
+                        text=unidecode(w.text or ""),
+                        start=(w.start or 0) / 1000.0,
+                        end=(w.end or 0) / 1000.0,
+                    )
+                )
+        except Exception:
+            pass
+
+        self.transcript = TranscriptData(words=words)
+        return self.transcript
