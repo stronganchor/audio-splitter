@@ -76,6 +76,7 @@ class SplitterUI(tk.Tk):
         self.var_bitrate = tk.StringVar(value="192k")
         self.var_lang = tk.StringVar(value="en")
         self.var_segments_mode = tk.StringVar(value="Speech")       # Speech | Silence
+        self.var_bypass_processing = tk.BooleanVar(value=False)
 
         # Build UI
         self._build_controls()
@@ -114,6 +115,7 @@ class SplitterUI(tk.Tk):
         cmb_mode.bind("<<ComboboxSelected>>", lambda e: self.on_detection_param_change())
 
         ttk.Button(frm, text="Process/Visualize", command=self.on_process).grid(row=0, column=7, padx=6)
+        ttk.Checkbutton(frm, text="Bypass NR/Loudnorm", variable=self.var_bypass_processing).grid(row=0, column=8, padx=2)
 
         # Detector row
         ttk.Label(frm, text="Detector:").grid(row=1, column=0, sticky="e")
@@ -225,41 +227,18 @@ class SplitterUI(tk.Tk):
             messagebox.showinfo("No file", "Please choose a file first.")
             return
 
-        self._set_status("Processing with noise reduction + loudness normalization…")
+        if self.var_bypass_processing.get():
+            self._set_status("Decoding only (no noise reduction / loudness normalization)…")
+        else:
+            self._set_status("Processing with noise reduction + loudness normalization…")
+
         self.processor.load_and_process(
             self.processor.input_path,
             use_more_noise=self.var_more_noise.get(),
             target_lufs=float(self.var_lufs.get()),
+            skip_processing=self.var_bypass_processing.get(),
         )
 
-        # Build a light-weight envelope for plotting (decimated)
-        x = self.processor.samples
-        sr = self.processor.sample_rate
-        if x is not None and sr is not None:
-            max_points = 8000
-            n = len(x)
-            if n <= max_points:
-                self.envelope_x = np.linspace(0, self.processor.duration, n)
-                self.envelope_y = x
-            else:
-                bin_size = int(math.ceil(n / max_points))
-                trimmed = x[: (n // bin_size) * bin_size]
-                y = trimmed.reshape(-1, bin_size)
-                y = np.max(np.abs(y), axis=1) * np.sign(np.sum(y, axis=1))
-                self.envelope_x = np.linspace(0, self.processor.duration, len(y))
-                self.envelope_y = y
-
-        self.boundaries = [0.0, self.processor.duration]
-        self.selected_seg_idx = None
-        self.current_segments = []
-        self.first_interval_is_segment = True
-
-        self.var_view_start.set(0.0)
-        self._update_view_slider_range()
-        self._refresh_plot(False)
-        self._apply_view_limits()
-
-        self._set_status("Processed. Use Auto-Detect or add boundaries manually.")
 
     def on_detection_param_change(self, _evt=None) -> None:
         if self.processor.processed_wav:
