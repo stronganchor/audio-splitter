@@ -196,42 +196,50 @@ class AudioProcessor:
 
     # -- preprocessing --
 
-    def load_and_process(self, path: str, use_more_noise: bool, target_lufs: float) -> None:
+    def load_and_process(self, path: str, use_more_noise: bool, target_lufs: float, skip_processing: bool = False) -> None:
         """
-        Run ffmpeg with noise reduction + loudnorm, convert to mono 48k WAV.
-        For Opus inputs: use gentler denoise, two-pass loudnorm (measure→apply), and a limiter.
+        Convert input to mono 48k WAV. If skip_processing is True, do *not* apply
+        noise reduction or loudness normalization—just decode and resample.
+        For Opus inputs (when not skipping): gentler denoise, two-pass loudnorm, optional limiter.
         Populates: processed_wav, sample_rate, samples, duration, rms_db.
         """
         if not ffmpeg_exists():
             raise RuntimeError("ffmpeg was not found in PATH.")
 
         self.input_path = path
-        codec = (_ffprobe_codec_name(path) or "").lower()
         out_wav = os.path.join(self.temp_dir, "processed.wav")
 
-        if codec == "opus":
-            pre = "highpass=f=60,afftdn=nf=-48"
-            post = "alimiter=limit=-1.0:level=true" if self._ffmpeg_has_filter("alimiter") else None
-            self._process_with_two_pass_loudnorm(
-                src=path, prefilter=pre,
-                I=target_lufs, TP=-2.0, LRA=11.0,
-                postfilter=post,
-                out_wav=out_wav
+        if skip_processing:
+            # Decode-only path (no NR / loudnorm)
+            run = subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", path, "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
-        else:
-            # Non-Opus: keep previous single-pass flow
-            nf = MORE_NOISE_REDUCTION_LEVEL if use_more_noise else LESS_NOISE_REDUCTION_LEVEL
-            out_wav = os.path.join(self.temp_dir, "processed.wav")
-            filter_chain = f"afftdn=nf={nf},loudnorm=I={target_lufs}:TP=-2:LRA=11"
-            cmd = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", path,
-                "-af", filter_chain,
-                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
-            ]
-            run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if run.returncode != 0:
-                raise RuntimeError("ffmpeg processing failed.")
+                raise RuntimeError("ffmpeg decode failed.")
+        else:
+            codec = (_ffprobe_codec_name(path) or "").lower()
+            if codec == "opus":
+                pre = "highpass=f=60,afftdn=nf=-48"
+                post = "alimiter=limit=-1.0:level=true" if self._ffmpeg_has_filter("alimiter") else None
+                self._process_with_two_pass_loudnorm(
+                    src=path, prefilter=pre,
+                    I=target_lufs, TP=-2.0, LRA=11.0,
+                    postfilter=post,
+                    out_wav=out_wav
+                )
+            else:
+                nf = MORE_NOISE_REDUCTION_LEVEL if use_more_noise else LESS_NOISE_REDUCTION_LEVEL
+                filter_chain = f"afftdn=nf={nf},loudnorm=I={target_lufs}:TP=-2:LRA=11"
+                run = subprocess.run(
+                    ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                     "-i", path, "-af", filter_chain,
+                     "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+                if run.returncode != 0:
+                    raise RuntimeError("ffmpeg processing failed.")
 
         self.processed_wav = out_wav
         self._load_wav(out_wav)
