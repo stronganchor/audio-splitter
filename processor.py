@@ -116,11 +116,8 @@ def _parse_loudnorm_json(stderr_text: str) -> Optional[Dict[str, float]]:
     for blob in reversed(blocks):
         try:
             data = json.loads(blob)
-            # ffmpeg may emit as strings; coerce to float
-            need = ["input_i", "input_tp", "input_lra", "input_thresh",
-                    "target_offset", "measured_i", "measured_lra", "measured_tp", "measured_thresh", "offset"]
             present = {k.lower(): v for k, v in data.items()}
-            # Normalize keys
+
             def fget(*keys):
                 for k in keys:
                     v = present.get(k)
@@ -161,7 +158,7 @@ class AudioProcessor:
         atexit.register(self.cleanup)
 
         # Results of processing
-        self.processed_wav: Optional[str] = None  # mono, 48k, pcm_s16le
+        self.processed_wav: Optional[str] = None  # mono, 48k, pcm_s32le
         self.sample_rate: Optional[int] = None
         self.samples: Optional[np.ndarray] = None  # mono float32 [-1..1]
         self.duration: float = 0.0
@@ -217,11 +214,10 @@ class AudioProcessor:
                     "-i", path,
                     "-map", "0:a:0?",  # first audio stream if present
                     "-vn", "-sn", "-dn",
-                    "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", out_wav
+                    "-ar", "48000", "-ac", "1", "-c:a", "pcm_s32le", out_wav
                 ],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
-
             if run.returncode != 0:
                 raise RuntimeError("ffmpeg decode failed.")
         else:
@@ -242,9 +238,9 @@ class AudioProcessor:
                     [
                         "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
                         "-i", path,
-                        "-map", "0:a:0?",  # pick first audio stream if present
-                        "-vn", "-sn", "-dn",
-                        "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav
+                        "-af", filter_chain,
+                        "-map", "0:a:0?", "-vn", "-sn", "-dn",
+                        "-ar", "48000", "-ac", "1", "-c:a", "pcm_s32le", out_wav
                     ],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
                 )
@@ -284,7 +280,6 @@ class AudioProcessor:
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
-
         stats = _parse_loudnorm_json(run1.stderr or "")
         if not stats:
             chain = f"{prefilter},loudnorm=I={I}:TP={TP}:LRA={LRA}"
@@ -292,7 +287,7 @@ class AudioProcessor:
                 chain = f"{chain},{postfilter}"
             fb = subprocess.run(
                 ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", src,
-                 "-af", chain, "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", out_wav],
+                 "-af", chain, "-ar", "48000", "-ac", "1", "-c:a", "pcm_s32le", out_wav],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
             if fb.returncode != 0:
@@ -300,13 +295,12 @@ class AudioProcessor:
                 fb2 = subprocess.run(
                     ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", src,
                      "-af", f"{prefilter},loudnorm=I={I}:TP={TP}:LRA={LRA}",
-                     "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", out_wav],
+                     "-ar", "48000", "-ac", "1", "-c:a", "pcm_s32le", out_wav],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
                 )
                 if fb2.returncode != 0:
                     raise RuntimeError("ffmpeg processing (fallback) failed.")
             return
-
 
         # ---- Pass 2: apply ----
         # Plug measured_* and offset into loudnorm and add a limiter.
@@ -330,11 +324,10 @@ class AudioProcessor:
                 "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
                 "-i", src,
                 "-af", chain,
-                "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", out_wav
+                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s32le", out_wav
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
-
         if run2.returncode != 0:
             raise RuntimeError("ffmpeg processing (pass2) failed.")
 
@@ -346,25 +339,24 @@ class AudioProcessor:
             sampwidth = wf.getsampwidth()
             self.sample_rate = sr
             self.duration = n / float(sr)
-    
+
             frames = wf.readframes(n)
             if sampwidth == 4:
-                audio = np.frombuffer(frames, dtype=np.float32)
-                # Ensure mono
+                # 32-bit *integer* PCM (pcm_s32le)
+                audio = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
                 if ch == 2:
                     audio = audio.reshape(-1, 2).mean(axis=1)
-                # Clamp any stray out-of-range values
-                audio = np.clip(audio, -1.0, 1.0)
             elif sampwidth == 2:
+                # 16-bit PCM
                 audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
                 if ch == 2:
                     audio = audio.reshape(-1, 2).mean(axis=1)
             else:
-                # Fallback: interpret as int16 to avoid crashing
+                # Fallback: interpret as 16-bit
                 audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
                 if ch == 2:
                     audio = audio.reshape(-1, 2).mean(axis=1)
-            self.samples = audio
+            self.samples = np.clip(audio, -1.0, 1.0)
 
     def _compute_rms_db(self) -> None:
         """Compute a smoothed RMS envelope in dBFS (~10 ms hop, ~50 ms smoothing)."""
@@ -410,12 +402,11 @@ class AudioProcessor:
             return []
 
         cmd = [
-            "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-i", path,
-            "-af", filter_chain,
-            "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", out_wav
+            "ffmpeg", "-hide_banner", "-nostats",
+            "-i", self.processed_wav,
+            "-af", f"silencedetect=noise={threshold_db}dB:d={min_silence}",
+            "-f", "null", "-"
         ]
-
         run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
         text = run.stderr
 
@@ -498,7 +489,6 @@ class AudioProcessor:
                 pairs.append((s, e))
 
         return self._sanitize_pairs(pairs)
-
 
     # -- conversion helpers --
 
