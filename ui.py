@@ -95,6 +95,7 @@ class SplitterUI(tk.Tk):
         self.bind("<<ViewChanged>>", lambda e: self._apply_view_limits())
         self.canvas.mpl_connect("scroll_event", self._on_scroll_event)
         self.canvas.mpl_connect("button_press_event", self.on_plot_click)
+        self.canvas.mpl_connect("button_press_event", self.on_plot_double_click)
         self.canvas.mpl_connect("button_release_event", self.on_plot_release)
         self.canvas.mpl_connect("motion_notify_event", self.on_plot_motion)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -436,6 +437,18 @@ class SplitterUI(tk.Tk):
             a, b = self.boundaries[seg], self.boundaries[seg + 1]
             self._set_status(f"Selected segment #{seg + 1}: {time_to_str(a)} – {time_to_str(b)}")
 
+    def on_plot_double_click(self, event) -> None:
+        if event.inaxes != self.ax or not self.processor.processed_wav:
+            return
+
+        if event.dblclick:
+            x = float(event.xdata)
+            seg = self._segment_index_at_time(x)
+            if seg is not None:
+                self.selected_seg_idx = seg
+                self._refresh_plot(True)
+                self.play_selected_segment()
+
     def on_plot_motion(self, event) -> None:
         if self.drag_idx is None or event.inaxes != self.ax:
             return
@@ -497,6 +510,7 @@ class SplitterUI(tk.Tk):
         fmt = self.var_format.get().lower()
         bitrate = self.var_bitrate.get()
         src = self.processor.processed_wav
+        target_lufs = float(self.var_lufs.get())
 
         count = 0
         for i in range(len(self.boundaries) - 1):
@@ -514,12 +528,13 @@ class SplitterUI(tk.Tk):
             fd = min(0.006, max(0.0, dur * 0.25))
             fade_out_start = max(0.0, dur - fd)
 
-            # Trim inside the filtergraph (no -ss/-t ambiguity), then reset PTS and fade
+            # Build filter chain: trim -> reset PTS -> fade in/out -> loudness normalize
             filt = (
                 f"atrim=start={a:.6f}:end={b:.6f},"
                 f"asetpts=PTS-STARTPTS,"
                 f"afade=t=in:st=0:d={fd:.4f},"
-                f"afade=t=out:st={fade_out_start:.4f}:d={fd:.4f}"
+                f"afade=t=out:st={fade_out_start:.4f}:d={fd:.4f},"
+                f"loudnorm=I={target_lufs}:TP=-2:LRA=11"
             )
 
             ext = "wav" if fmt == "wav" else "mp3"
